@@ -70,3 +70,6 @@ TF-IDF algoritması ile oyun tavsiye sistemi
    - Sistem, önerilen oyunlar arasından en iyi fiyat-performans oranına sahip oyunu belirler ve kullanıcıya sunar.
 
 ---
+
+### 5. **Sonuç**
+Bu proje, kullanıcıların oyun tercihlerini analiz ederek onlara en uygun oyunları önermeyi hedefleyen bir sistemdir. Kullanıcı geri bildirimleri ve fiyat-performans analizi gibi özelliklerle öneri sistemi daha da geliştirilmiştir. Bu sayede, kullanıcılar hem ilgi alanlarına uygun hem de bütçelerine uygun oyunlar bulabilirler.
