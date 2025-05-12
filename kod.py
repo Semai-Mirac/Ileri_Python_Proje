@@ -186,72 +186,116 @@ def onerilen_fiyat_performans_mantigi(games):
             except ValueError:
                 continue
     return best_game
+## --- Cache ve API’den açıklama çeken yardımcı ---
+cache = load_cache()
 
-
+def get_about_text(app_id):
+    key = str(app_id)
+    # 1) Cache’de varsa direkt dön
+    if key in cache:
+        return cache[key]
+    # 2) Yoksa Steam API’den çek, temizle, cache’e kaydet
+    url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&key={API_KEY}"
+    try:
+        r = requests.get(url, timeout=5)
+        data = r.json().get(key, {}).get('data', {})
+        raw = data.get('about_the_game', '') or ''
+        clean = BeautifulSoup(raw, "html.parser").get_text()
+        if clean:
+            cache[key] = clean
+            save_cache(cache)
+        return clean
+    except Exception:
+        return ''
 # --- Oyun Öneri Sistemi ---
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 def onerilen_oyun_mantigi(game_name, user_id=None):
     sel = game_name.lower().strip()
-    sel_row = None
     cache = load_cache()
 
-    # results listesini burada temizliyoruz
-    results = []  # Listeyi her seferinde boşaltıyoruz
+    # --- 1) CSV'yi oku ve temizle ---
+    df = pd.read_csv(
+        INPUT_CSV,
+        usecols=['AppID','Name','Genres','Tags','Screenshots'],
+        dtype={'AppID':str}, encoding='ISO-8859-1'
+    ).dropna(subset=['Name'])
+    df['Name'] = df['Name'].astype(str)
+    df['nm']   = df['Name'].str.lower().str.strip()
 
-    for parca in pd.read_csv(
-            INPUT_CSV, usecols=['AppID', 'Name', 'Genres', 'Tags', 'Screenshots'], dtype={'AppID': str},
-            encoding='ISO-8859-1', chunksize=CHUNK_SIZE, low_memory=False
-    ):
-        parca['nm'] = parca['Name'].astype(str).str.lower().str.strip()
-        tmp = parca[parca['nm'] == sel]
-        if not tmp.empty:
-            sel_row = tmp.iloc[0]
-            break
-    if sel_row is None:
+    sel_rows = df[df['nm'] == sel]
+    if sel_rows.empty:
         return []
-    app_id = sel_row['AppID']
-    sel_text = f"{sel_row['Genres']} {sel_row['Tags']} {sel_row['Screenshots']}"
-    all_ids, all_names, all_texts = [], [], []
-    for parca in pd.read_csv(
-            INPUT_CSV, usecols=['AppID', 'Name', 'Genres', 'Tags', 'Screenshots'], dtype={'AppID': str},
-            encoding='ISO-8859-1', chunksize=CHUNK_SIZE, low_memory=False
-    ):
-        for _, r in parca.iterrows():
-            aid = r['AppID']
-            name = r['Name'] if isinstance(r['Name'], str) else ''
-            if aid == app_id or not name: continue
-            all_ids.append(aid)
-            all_names.append(name)
-            all_texts.append(f"{r['Genres']} {r['Tags']} {r['Screenshots']}")
+    sel_row    = sel_rows.iloc[0]
+    sel_app_id = sel_row['AppID']
+    sel_text   = f"{sel_row['Genres']} {sel_row['Tags']} {sel_row['Screenshots']}"
 
-    vec = TfidfVectorizer(stop_words='english')
-    tfidf = vec.fit_transform(all_texts)
-    user_vec = vec.transform([sel_text])
-    sims = cosine_similarity(user_vec, tfidf).flatten()
-    candidates = sorted(zip(all_ids, all_names, sims), key=lambda x: x[2], reverse=True)
-    candidates = [(a, n, s) for a, n, s in candidates if isinstance(n, str) and 'dlc' not in n.lower()][:10]
+    # --- 2) TF-IDF ile benzerlik ---
+    others     = df[df['AppID'] != sel_app_id]
+    all_ids    = others['AppID'].tolist()
+    all_names  = others['Name'].tolist()
+    all_texts  = (others['Genres'].astype(str) + " " +
+                  others['Tags'].astype(str)   + " " +
+                  others['Screenshots'].astype(str)).tolist()
 
+    vec        = TfidfVectorizer(stop_words='english')
+    tfidf      = vec.fit_transform(all_texts)
+    user_vec   = vec.transform([sel_text])
+    sims       = cosine_similarity(user_vec, tfidf).flatten()
+
+    ranked = sorted(zip(all_ids, all_names, sims),
+                    key=lambda x: x[2], reverse=True)
+    candidates = [
+        (aid, name, score)
+        for aid, name, score in ranked
+        if isinstance(name, str) and 'dlc' not in name.lower()
+    ][:10]
+
+    # --- 3) Geri bildirimleri al ---
     liked_ids, disliked_ids = load_user_feedback(user_id) if user_id else (set(), set())
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(bilgi_cek, a, cache): a for a, _, _ in candidates}
-        abouts = {futures[f]: f.result() for f in as_completed(futures)}
+    # --- 4) ThreadPool ile about metinlerini çek ---
+    abouts = {}
+    with ThreadPoolExecutor(max_workers=10) as exe:
+        future_to_aid = {exe.submit(get_about_text, aid): aid for aid,, in candidates}
+        for fut in as_completed(future_to_aid):
+            aid = future_to_aid[fut]
+            abouts[aid] = fut.result()
 
-    sel_kw = anahtar_kelime_cikti(bilgi_cek(app_id, cache), sel_row['Name'])
-    for a, n, sim in candidates:
-        kw = anahtar_kelime_cikti(abouts.get(a, ''), n)
-        ratio = len(set(sel_kw) & set(kw)) / len(sel_kw) if sel_kw else 0
-        feedback_boost = 0.1 if a in liked_ids else -0.2 if a in disliked_ids else 0
-        final_score = 0.7 * sim + 0.3 * ratio + feedback_boost
-        results.append((n, a, final_score))
+    # --- 5) Seçilen oyun için de ---
+    sel_about = get_about_text(sel_app_id)
 
-    # Fiyat Performans Önerisi Ekleyelim
-    best_game = onerilen_fiyat_performans_mantigi(results)
-    if best_game:
-        name, app_id, score, price = best_game
-        results.append((f"Fiyat Performans: {name}", app_id, score))
+    # --- 6) ThreadPool ile anahtar kelime çıkarımı ---
+    sel_kw = anahtar_kelime_cikti(sel_about, sel_row['Name'])
+    kw_map = {}
+    with ThreadPoolExecutor(max_workers=20) as exe:
+        future_to_pair = {
+            exe.submit(anahtar_kelime_cikti, abouts[aid], name): (aid, name)
+            for aid, name, _ in candidates
+        }
+        for fut in as_completed(future_to_pair):
+            aid, name = future_to_pair[fut]
+            kw_map[aid] = fut.result()
 
+    # --- 7) Sonuçları hesapla ---
+    results = []
+    for aid, name, sim in candidates:
+        kw     = kw_map.get(aid, [])
+        ratio  = len(set(sel_kw) & set(kw)) / len(sel_kw) if sel_kw else 0
+        boost  = 0.1 if aid in liked_ids else -0.2 if aid in disliked_ids else 0
+        score  = 0.7 * sim + 0.3 * ratio + boost
+        results.append((name, aid, score))
+
+    # --- 8) Fiyat-performans önerisi (opsiyonel) ---
+    best = onerilen_fiyat_performans_mantigi(results)
+    if best:
+        nm, aid, sc, pr = best
+        results.append((f"Fiyat Performans: {nm}", aid, sc))
+
+    # --- 9) Sırala ve dön ---
     results.sort(key=lambda x: x[2], reverse=True)
     return results[:3]
+
 
 def steam_isimleri_cevir(vanity):
     url = f"https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/?key={API_KEY}&vanityurl={vanity}"
@@ -349,7 +393,7 @@ def Sonraki_Oyun_basildiginda_oneri(steam_id):
 
     root.after(0, lambda: messagebox.showinfo('Bilgi','Geçerli oyun ismi bulunamadı.'))
 
-btn_manual.config(command=lambda: threading.Thread(target=lambda: [clear_results(), Onerileri_goster_basıldıgında_oneri(entry.get())], daemon=True).start())
-btn_steam.config(command=lambda: threading.Thread(target=lambda: [clear_results(), Sonraki_Oyun_basildiginda_oneri(steam_entry.get())], daemon=True).start())
+btn_manual.config(command=lambda: threading.Thread(target=lambda: [clear_results(), Onerileri_goster_basıldıgında_oneri(entry.get())]).start())
+btn_steam.config(command=lambda: threading.Thread(target=lambda: Sonraki_Oyun_basildiginda_oneri(steam_entry.get())).start())
 
 root.mainloop()
