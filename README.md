@@ -2,7 +2,7 @@
 TF-IDF algoritması ile oyun tavsiye sistemi
 ---
 
-##Veri setini bu linkten indirin
+#Veri setini bu linkten indirin = https://www.kaggle.com/datasets/fronkongames/steam-games-dataset
 
 ---
 
